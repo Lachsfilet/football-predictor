@@ -1,0 +1,98 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Football Match Predictor</title>
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+    <div class="app">
+        <!-- Header -->
+        <header class="header">
+            <div class="header-inner">
+                <div class="logo">
+                    <span class="logo-icon">⚽</span>
+                    <span class="logo-text">Football Predictor</span>
+                </div>
+                <nav class="nav">
+                    <button class="nav-btn active" data-tab="predict">Predict</button>
+                    <button class="nav-btn" data-tab="status">System</button>
+                </nav>
+            </div>
+        </header>
+
+        <!-- Main content -->
+        <main class="main">
+
+            <!-- ── PREDICT TAB ── -->
+            <section id="tab-predict" class="tab active">
+                <div class="card predict-card">
+                    <h2>Match Prediction</h2>
+                    <p class="subtitle">
+                        Enter matches below — one per line. Use format:<br>
+                        <code>Liverpool vs Arsenal</code> &nbsp;·&nbsp;
+                        <code>Barcelona - Real Madrid</code>
+                    </p>
+
+                    <div class="input-group">
+                        <label for="matches-input">Matches</label>
+                        <textarea
+                            id="matches-input"
+                            rows="6"
+                            placeholder="Liverpool vs Arsenal&#10;Barcelona vs Real Madrid&#10;Bayern Munich vs Dortmund"
+                            spellcheck="false"
+                        ></textarea>
+                    </div>
+
+                    <div class="actions">
+                        <button id="predict-btn" class="btn btn-primary">
+                            <span class="btn-icon">🔮</span> Predict
+                        </button>
+                        <button id="clear-btn" class="btn btn-ghost">Clear</button>
+                    </div>
+                </div>
+
+                <!-- Results -->
+                <div id="results" class="results hidden"></div>
+            </section>
+
+            <!-- ── SYSTEM TAB ── -->
+            <section id="tab-status" class="tab">
+                <div class="card">
+                    <h2>System Status</h2>
+                    <div id="status-content" class="status-grid">
+                        <p class="loading">Loading...</p>
+                    </div>
+                </div>
+
+                <div class="card">
+                    <h2>Data Management</h2>
+                    <div class="actions-row">
+                        <button id="sync-btn" class="btn btn-secondary">
+                            🔄 Sync Data Now
+                        </button>
+                        <button id="features-btn" class="btn btn-secondary">
+                            🧮 Compute Features
+                        </button>
+                        <button id="train-btn" class="btn btn-secondary">
+                            🤖 Train Model
+                        </button>
+                    </div>
+                    <div id="action-msg" class="action-msg hidden"></div>
+                </div>
+
+                <div class="card">
+                    <h2>Sync Logs</h2>
+                    <div id="logs-content">
+                        <p class="loading">Loading...</p>
+                    </div>
+                </div>
+            </section>
+
+        </main>
+    </div>
+
+    <script src="/static/app.js"></script>
+</body>
+</html>
