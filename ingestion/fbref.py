@@ -72,7 +72,9 @@ class FBrefConnector(BaseConnector):
             reader = Understat(leagues=[league_name], seasons=seasons)
             df = reader.read_schedule(include_matches_without_data=False)
         except FileNotFoundError:
-            logger.warning(f"[fbref] No cached Understat data for {league_name}; skipping")
+            logger.warning(
+                f"[fbref] Understat data for {league_name} not available yet (cache empty or download blocked); skipping"
+            )
             return 0
         except Exception as e:
             logger.error(f"[fbref] Understat failed for {league_name}: {e}")
@@ -122,14 +124,18 @@ class FBrefConnector(BaseConnector):
         }
 
     def _safe_float(self, val) -> Optional[float]:
+        if val is None or pd.isna(val):
+            return None
         try:
-            return float(val) if val is not None and val == val else None
+            return float(val)
         except (ValueError, TypeError):
             return None
 
     def _safe_int(self, val) -> Optional[int]:
+        if val is None or pd.isna(val):
+            return None
         try:
-            return int(val) if val is not None and val == val else None
+            return int(val)
         except (ValueError, TypeError):
             return None
 

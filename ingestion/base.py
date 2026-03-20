@@ -36,7 +36,12 @@ class BaseConnector(ABC):
         }
 
     def _get(self, url: str, headers: Optional[dict] = None, **kwargs) -> httpx.Response:
-        """Basic GET helper with default headers."""
+        """
+        Basic GET helper with default headers.
+
+        Note: retry/backoff logic has been removed; connectors should implement
+        their own handling when needed.
+        """
         merged_headers = dict(self.client.headers)
         if headers:
             merged_headers.update(headers)
