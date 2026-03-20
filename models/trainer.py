@@ -124,7 +124,7 @@ class ModelTrainer:
         return {
             "logistic_regression": self._build_pipeline(
                 LogisticRegression(
-                    max_iter=1000, C=1.0, multi_class="multinomial",
+                    max_iter=1000, C=1.0,
                     solver="lbfgs", random_state=42,
                 )
             ),
