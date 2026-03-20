@@ -78,7 +78,7 @@ class FBrefConnector(BaseConnector):
             df = reader.read_schedule(include_matches_without_data=False)
         except FileNotFoundError:
             logger.warning(
-                f"[fbref] Understat data for {league_name} not available yet (cache empty or download blocked); skipping"
+                f"[fbref] Understat data for {league_name} not available yet; ensure initial download succeeds"
             )
             return 0
         except Exception as e:
@@ -108,7 +108,7 @@ class FBrefConnector(BaseConnector):
         try:
             dt_val = pd.to_datetime(date_val)
             if getattr(dt_val, "tzinfo", None):
-                dt_val = dt_val.tz_localize(None)
+                dt_val = dt_val.tz_convert(None)
             match_date = dt_val.to_pydatetime()
         except (ValueError, TypeError):
             return None
@@ -200,7 +200,7 @@ class FBrefConnector(BaseConnector):
     # ──────────────────────────────────────────
 
     def _target_seasons(self) -> List[int]:
-        """Use seasons present in the DB; fall back to current and previous year."""
+        """Use seasons present in the DB; fall back to previous year and current year."""
         seasons: Set[int] = set()
         with db_session() as session:
             for season_val in session.execute(select(Match.season)).scalars().all():
