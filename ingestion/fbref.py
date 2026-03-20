@@ -81,7 +81,7 @@ class FBrefConnector(BaseConnector):
         except FileNotFoundError:
             logger.warning(
                 f"[fbref] Understat data for {league_name} not found in cache. "
-                "Run `python scripts/fetch_data.py --source fbref` (Understat xG) first or check connectivity."
+                "Run `python scripts/fetch_data.py --source fbref` to trigger the Understat (advanced stats) download or check connectivity."
             )
             return 0
         except Exception as e:
