@@ -40,7 +40,8 @@ class BaseConnector(ABC):
         Basic GET helper with default headers.
 
         Note: retry/backoff logic has been removed; connectors should implement
-        their own handling when needed or rely on upstream libraries when
+        their own handling when needed or rely on upstream libraries (e.g.
+        soccerdata's internal retry/backoff in FBrefConnector) when
         appropriate.
         """
         merged_headers = dict(self.client.headers)

@@ -31,6 +31,8 @@ UNDERSTAT_LEAGUES: Dict[str, str] = {
 
 
 class FBrefConnector(BaseConnector):
+    # Legacy source name preserved so CLI flags (--source fbref) and sync logs
+    # remain compatible, even though data now comes from Understat.
     source_name = "fbref"
 
     def __init__(self):
@@ -79,7 +81,7 @@ class FBrefConnector(BaseConnector):
         except FileNotFoundError:
             logger.warning(
                 f"[fbref] Understat data for {league_name} not found in cache. "
-                "Run `python scripts/fetch_data.py --source fbref` first or check connectivity."
+                "Run `python scripts/fetch_data.py --source fbref` (Understat xG) first or check connectivity."
             )
             return 0
         except Exception as e:
