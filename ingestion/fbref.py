@@ -107,7 +107,7 @@ class FBrefConnector(BaseConnector):
             return None
         try:
             dt_val = pd.to_datetime(date_val)
-            if getattr(dt_val, "tzinfo", None):
+            if dt_val.tzinfo is not None:
                 dt_val = dt_val.tz_convert(None)
             match_date = dt_val.to_pydatetime()
         except (ValueError, TypeError):
@@ -153,12 +153,14 @@ class FBrefConnector(BaseConnector):
             if not home_team or not away_team:
                 return False
 
+            match_day = record["match_date"].replace(hour=0, minute=0, second=0, microsecond=0)
+
             match = session.execute(
                 select(Match).where(
                     Match.home_team_id == home_team.id,
                     Match.away_team_id == away_team.id,
-                    Match.match_date >= record["match_date"].replace(hour=0, minute=0, second=0, microsecond=0),
-                    Match.match_date < record["match_date"].replace(hour=0, minute=0, second=0, microsecond=0) + pd.Timedelta(days=1),
+                    Match.match_date >= match_day,
+                    Match.match_date < match_day + pd.Timedelta(days=1),
                 )
             ).scalar_one_or_none()
 
