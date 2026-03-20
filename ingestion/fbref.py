@@ -6,8 +6,8 @@ source that provides xG values. The public class name is kept for backwards
 compatibility with existing scripts.
 """
 from datetime import datetime
-from typing import Dict, List, Optional, Set
 import re
+from typing import Dict, List, Optional, Set
 
 import pandas as pd
 from loguru import logger
@@ -66,7 +66,12 @@ class FBrefConnector(BaseConnector):
     # ──────────────────────────────────────────
 
     def _sync_league_stats(self, code: str, league_name: str, seasons: List[int]) -> int:
-        """Fetch xG-enhanced match results for a league."""
+        """
+        Fetch xG-enhanced match results for a league.
+
+        soccerdata handles its own caching and request retries; we rely on its
+        built-in resilience rather than duplicating retry logic here.
+        """
         logger.info(f"[fbref] Fetching Understat data for {league_name} seasons {seasons}")
         try:
             reader = Understat(leagues=[league_name], seasons=seasons)
