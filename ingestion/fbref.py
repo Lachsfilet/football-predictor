@@ -7,7 +7,7 @@ compatibility with existing scripts.
 """
 from datetime import datetime, timezone
 import re
-from typing import Dict, List, Optional, Set
+from typing import Dict, List, Mapping, Optional, Set
 
 import pandas as pd
 from loguru import logger
@@ -81,7 +81,7 @@ class FBrefConnector(BaseConnector):
         except FileNotFoundError:
             logger.warning(
                 f"[fbref] Understat data for {league_name} not found in cache. "
-                "Run `python scripts/fetch_data.py --source fbref` to trigger the Understat (advanced stats) download or check connectivity."
+                "Run the data fetch script (e.g., `python scripts/fetch_data.py --source fbref`) to trigger the Understat download or check connectivity."
             )
             return 0
         except Exception as e:
@@ -95,8 +95,8 @@ class FBrefConnector(BaseConnector):
         inserted = 0
         with db_session() as session:
             resolver = TeamNameResolver(session)
-            for _, row in df.iterrows():
-                record = self._build_record(row)
+            for row in df.itertuples(index=False):
+                record = self._build_record(row._asdict())
                 if not record:
                     continue
                 if self._save_stats(session, resolver, record):
@@ -105,7 +105,7 @@ class FBrefConnector(BaseConnector):
         logger.info(f"[fbref][{code}] Stats records saved: {inserted}")
         return inserted
 
-    def _build_record(self, row: pd.Series) -> Optional[dict]:
+    def _build_record(self, row: Mapping[str, object]) -> Optional[dict]:
         """Map a soccerdata schedule row to our internal structure."""
         date_val = row.get("date")
         if pd.isna(date_val):
