@@ -78,7 +78,7 @@ class FBrefConnector(BaseConnector):
             df = reader.read_schedule(include_matches_without_data=False)
         except FileNotFoundError:
             logger.warning(
-                f"[fbref] Understat data for {league_name} not available yet; ensure initial download succeeds"
+                f"[fbref] Understat data for {league_name} not found in cache. Run the data download first or check connectivity."
             )
             return 0
         except Exception as e:
