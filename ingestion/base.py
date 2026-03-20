@@ -1,7 +1,6 @@
 """
 Base class for all data ingestion connectors.
 """
-import time
 from abc import ABC, abstractmethod
 from datetime import datetime
 from typing import Optional
@@ -37,27 +36,19 @@ class BaseConnector(ABC):
         }
 
     def _get(self, url: str, headers: Optional[dict] = None, **kwargs) -> httpx.Response:
-        """GET with retry logic and rate-limit delay."""
+        """
+        Basic GET helper with default headers.
+
+        Note: retry/backoff logic has been removed; connectors should implement
+        their own handling when needed or rely on upstream libraries (for
+        example, soccerdata's internal retry/backoff) when appropriate.
+        """
         merged_headers = dict(self.client.headers)
         if headers:
             merged_headers.update(headers)
-        for attempt in range(3):
-            try:
-                response = self.client.get(url, headers=merged_headers, **kwargs)
-                response.raise_for_status()
-                time.sleep(settings.SCRAPE_DELAY_SECONDS)
-                return response
-            except httpx.HTTPStatusError as e:
-                if e.response.status_code == 429:
-                    wait = 60 * (attempt + 1)
-                    logger.warning(f"Rate limited by {self.source_name}. Waiting {wait}s")
-                    time.sleep(wait)
-                else:
-                    raise
-            except httpx.RequestError as e:
-                logger.warning(f"Request error (attempt {attempt+1}/3): {e}")
-                time.sleep(5 * (attempt + 1))
-        raise RuntimeError(f"Failed to GET {url} after 3 attempts")
+        response = self.client.get(url, headers=merged_headers, **kwargs)
+        response.raise_for_status()
+        return response
 
     def log_sync(
         self,

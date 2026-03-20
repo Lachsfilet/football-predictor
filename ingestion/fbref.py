@@ -1,59 +1,63 @@
 """
-FBref scraper for advanced match statistics (xG, shots, possession, etc.).
-FBref allows scraping with polite rate limiting.
+Advanced match statistics ingestion using soccerdata's Understat backend.
+
+Replaces the brittle HTML scraping of fbref.com with a stable, cached data
+source that provides xG values. The public class name is kept for backwards
+compatibility with existing scripts.
 """
+from datetime import datetime, timezone
 import re
-import time
-from datetime import datetime
-from typing import Optional, Dict, List
+from typing import Dict, List, Mapping, Optional, Set
+
 import pandas as pd
-from bs4 import BeautifulSoup
 from loguru import logger
 from sqlalchemy import select
+from soccerdata import Understat
 
 from config.settings import settings
 from database.session import db_session
-from database.models import Match, Team, TeamMatchStat
+from database.models import Match, TeamMatchStat
 from .base import BaseConnector
+from .team_resolver import TeamNameResolver
 
-# FBref competition URL slugs for top leagues
-FBREF_LEAGUES: Dict[str, Dict] = {
-    "PL":  {"url_slug": "9/Premier-League",    "name": "Premier League"},
-    "PD":  {"url_slug": "12/La-Liga",          "name": "La Liga"},
-    "BL1": {"url_slug": "20/Bundesliga",       "name": "Bundesliga"},
-    "SA":  {"url_slug": "11/Serie-A",          "name": "Serie A"},
-    "FL1": {"url_slug": "13/Ligue-1",          "name": "Ligue 1"},
+# Mapping of internal competition codes to soccerdata/Understat league names
+UNDERSTAT_LEAGUES: Dict[str, str] = {
+    "PL": "ENG-Premier League",
+    "PD": "ESP-La Liga",
+    "BL1": "GER-Bundesliga",
+    "SA": "ITA-Serie A",
+    "FL1": "FRA-Ligue 1",
 }
-
-FBREF_BASE = "https://fbref.com"
 
 
 class FBrefConnector(BaseConnector):
+    # Legacy source name preserved so CLI flags (--source fbref) and sync logs
+    # remain compatible, even though data now comes from Understat.
     source_name = "fbref"
-    base_url = FBREF_BASE
 
-    # FBref asks for a longer delay between requests
     def __init__(self):
+        # BaseConnector currently sets up an httpx client; we don't rely on it
+        # here but keep the initialization for consistency with context manager
+        # behavior used elsewhere.
         super().__init__()
-        self.client.headers.update({
-            "Accept-Encoding": "gzip, deflate",
-            "Referer": "https://fbref.com",
-        })
 
     # ──────────────────────────────────────────
     # Public entry point
     # ──────────────────────────────────────────
 
     def fetch_all(self):
-        started = datetime.utcnow()
+        started = datetime.now(timezone.utc)
         total = 0
+        seasons = self._target_seasons()
+
         for code in settings.tracked_leagues_list:
-            meta = FBREF_LEAGUES.get(code)
-            if not meta:
+            league = UNDERSTAT_LEAGUES.get(code)
+            if not league:
+                logger.warning(f"[fbref] No Understat mapping for league code {code}")
                 continue
             try:
-                n = self._sync_league_stats(code, meta)
-                total += n
+                inserted = self._sync_league_stats(code, league, seasons)
+                total += inserted
             except Exception as e:
                 logger.error(f"[fbref] Error syncing {code}: {e}")
 
@@ -63,250 +67,173 @@ class FBrefConnector(BaseConnector):
     # Per-league sync
     # ──────────────────────────────────────────
 
-    def _sync_league_stats(self, code: str, meta: dict) -> int:
-        """Scrape season match scores + stats page."""
-        slug = meta["url_slug"]
-        url = f"{FBREF_BASE}/en/comps/{slug}/schedule/{meta['name'].replace(' ', '-')}-Scores-and-Fixtures"
-        logger.info(f"[fbref] Fetching scores page: {url}")
+    def _sync_league_stats(self, code: str, league_name: str, seasons: List[int]) -> int:
+        """
+        Fetch xG-enhanced match results for a league.
 
+        soccerdata handles its own caching and request retries; we rely on its
+        built-in resilience rather than duplicating retry logic here.
+        """
+        logger.info(f"[fbref] Fetching Understat data for {league_name} seasons {seasons}")
         try:
-            resp = self._get(url)
+            reader = Understat(leagues=[league_name], seasons=seasons)
+            df = reader.read_schedule(include_matches_without_data=False)
+        except FileNotFoundError:
+            logger.warning(
+                f"[fbref] Understat data for {league_name} not found in cache. "
+                "Run the data fetch script (e.g., `python scripts/fetch_data.py --source fbref`) to trigger the Understat download or check connectivity."
+            )
+            return 0
         except Exception as e:
-            logger.error(f"[fbref] Could not load schedule for {code}: {e}")
+            logger.error(f"[fbref] Understat failed for {league_name}: {e}")
             return 0
 
-        soup = BeautifulSoup(resp.text, "lxml")
-        table = soup.find("table", {"id": re.compile(r"sched_")})
-        if not table:
-            logger.warning(f"[fbref] No schedule table found for {code}")
+        if df.empty:
+            logger.warning(f"[fbref] No Understat schedule data for {league_name}")
             return 0
 
-        rows = table.find("tbody").find_all("tr") if table.find("tbody") else []
         inserted = 0
-        for row in rows:
-            if row.get("class") and "spacer" in row.get("class", []):
-                continue
-            record = self._parse_schedule_row(row)
-            if not record:
-                continue
-            if self._save_stats(record, code):
-                inserted += 1
-            # polite delay
-            time.sleep(0.5)
+        with db_session() as session:
+            resolver = TeamNameResolver(session)
+            for row in df.itertuples(index=False):
+                record = self._build_record(row._asdict())
+                if not record:
+                    continue
+                if self._save_stats(session, resolver, record):
+                    inserted += 1
 
         logger.info(f"[fbref][{code}] Stats records saved: {inserted}")
         return inserted
 
-    def _parse_schedule_row(self, row) -> Optional[dict]:
-        cells = row.find_all(["td", "th"])
-        if len(cells) < 10:
+    def _build_record(self, row: Mapping[str, object]) -> Optional[dict]:
+        """Map a soccerdata schedule row to our internal structure."""
+        date_val = row.get("date")
+        if pd.isna(date_val):
+            return None
+        try:
+            dt_val = pd.to_datetime(date_val)
+            if dt_val.tzinfo is not None:
+                dt_val = dt_val.tz_convert(None)
+            match_date = dt_val.to_pydatetime()
+        except (ValueError, TypeError):
             return None
 
-        def text(tag_id: str) -> str:
-            el = row.find(attrs={"data-stat": tag_id})
-            return el.get_text(strip=True) if el else ""
-
-        date_str = text("date")
-        if not date_str:
-            return None
-
-        home = text("home_team")
-        away = text("away_team")
-        score = text("score")
-
+        home = row.get("home_team")
+        away = row.get("away_team")
         if not home or not away:
             return None
 
-        home_goals, away_goals = None, None
-        if "–" in score or "-" in score:
-            parts = score.replace("–", "-").split("-")
-            try:
-                home_goals = int(parts[0].strip())
-                away_goals = int(parts[1].strip())
-            except (ValueError, IndexError):
-                pass
-
-        xg_home = self._safe_float(text("home_xg"))
-        xg_away = self._safe_float(text("away_xg"))
-
-        match_url = None
-        score_tag = row.find(attrs={"data-stat": "score"})
-        if score_tag:
-            a = score_tag.find("a")
-            if a and a.get("href"):
-                match_url = FBREF_BASE + a["href"]
-
         return {
-            "date_str": date_str,
-            "home_team_name": home,
-            "away_team_name": away,
-            "home_goals": home_goals,
-            "away_goals": away_goals,
-            "xg_home": xg_home,
-            "xg_away": xg_away,
-            "match_url": match_url,
+            "match_date": match_date,
+            "home_team_name": str(home),
+            "away_team_name": str(away),
+            "home_goals": self._safe_int(row.get("home_goals")),
+            "away_goals": self._safe_int(row.get("away_goals")),
+            "xg_home": self._safe_float(row.get("home_xg")),
+            "xg_away": self._safe_float(row.get("away_xg")),
         }
 
-    def _safe_float(self, val: str) -> Optional[float]:
+    def _safe_float(self, val) -> Optional[float]:
+        if val is None or pd.isna(val):
+            return None
         try:
-            return float(val) if val else None
-        except ValueError:
+            return float(val)
+        except (ValueError, TypeError):
             return None
 
-    def _save_stats(self, record: dict, comp_code: str) -> bool:
-        """Match the parsed row to a DB Match and store stats."""
-        home_name = record["home_team_name"]
-        away_name = record["away_team_name"]
+    def _safe_int(self, val) -> Optional[int]:
+        if val is None or pd.isna(val):
+            return None
+        try:
+            return int(val)
+        except (ValueError, TypeError):
+            return None
 
-        with db_session() as session:
-            home_team = self._find_team(session, home_name)
-            away_team = self._find_team(session, away_name)
-            if not home_team or not away_team:
-                return False
+    def _save_stats(self, session, resolver: TeamNameResolver, record: dict) -> bool:
+        """Match the row to a DB Match and store xG values."""
+        home_team = resolver.resolve(record["home_team_name"])
+        away_team = resolver.resolve(record["away_team_name"])
+        if not home_team or not away_team:
+            return False
 
-            # Find the match
-            try:
-                match_date = datetime.strptime(record["date_str"], "%Y-%m-%d")
-            except ValueError:
-                return False
+        match_day = record["match_date"].replace(hour=0, minute=0, second=0, microsecond=0)
 
-            match = session.execute(
-                select(Match).where(
-                    Match.home_team_id == home_team.id,
-                    Match.away_team_id == away_team.id,
-                    Match.match_date >= datetime(match_date.year, match_date.month, match_date.day),
-                    Match.match_date < datetime(match_date.year, match_date.month, match_date.day) + pd.Timedelta(days=1),
+        match = session.execute(
+            select(Match).where(
+                Match.home_team_id == home_team.id,
+                Match.away_team_id == away_team.id,
+                Match.match_date >= match_day,
+                Match.match_date < match_day + pd.Timedelta(days=1),
+            )
+        ).scalar_one_or_none()
+
+        if not match:
+            return False
+
+        for team_id, is_home, xg, xga, goals in [
+            (home_team.id, True, record["xg_home"], record["xg_away"], record["home_goals"]),
+            (away_team.id, False, record["xg_away"], record["xg_home"], record["away_goals"]),
+        ]:
+            stat = session.execute(
+                select(TeamMatchStat).where(
+                    TeamMatchStat.match_id == match.id,
+                    TeamMatchStat.team_id == team_id,
                 )
             ).scalar_one_or_none()
 
-            if not match:
-                return False
-
-            # Upsert home stats
-            for team_id, is_home, xg, xga, goals in [
-                (home_team.id, True, record["xg_home"], record["xg_away"], record["home_goals"]),
-                (away_team.id, False, record["xg_away"], record["xg_home"], record["away_goals"]),
-            ]:
-                stat = session.execute(
-                    select(TeamMatchStat).where(
-                        TeamMatchStat.match_id == match.id,
-                        TeamMatchStat.team_id == team_id,
-                    )
-                ).scalar_one_or_none()
-
-                if stat:
-                    if xg is not None:
-                        stat.xg = xg
-                    if xga is not None:
-                        stat.xga = xga
-                else:
-                    session.add(TeamMatchStat(
-                        match_id=match.id,
-                        team_id=team_id,
-                        is_home=is_home,
-                        xg=xg,
-                        xga=xga,
-                        goals=goals,
-                    ))
+            if stat:
+                if xg is not None:
+                    stat.xg = xg
+                if xga is not None:
+                    stat.xga = xga
+                if goals is not None:
+                    stat.goals = goals
+            else:
+                stat_payload = {
+                    "match_id": match.id,
+                    "team_id": team_id,
+                    "is_home": is_home,
+                    "xg": xg,
+                    "xga": xga,
+                    "goals": goals,
+                }
+                session.add(TeamMatchStat(**stat_payload))
 
         return True
 
-    def _find_team(self, session, name: str) -> Optional[Team]:
-        """Fuzzy-match a team name to the DB."""
-        from ingestion.team_resolver import TeamNameResolver
-        resolver = TeamNameResolver(session)
-        return resolver.resolve(name)
-
     # ──────────────────────────────────────────
-    # Detailed match stats (optional deep fetch)
+    # Season selection helpers
     # ──────────────────────────────────────────
 
-    def fetch_match_detail(self, match_url: str, match_id: int):
-        """Scrape detailed stats from a single match report page."""
-        if not match_url:
-            return
-        try:
-            resp = self._get(match_url)
-        except Exception as e:
-            logger.warning(f"[fbref] Could not load match detail {match_url}: {e}")
-            return
-
-        soup = BeautifulSoup(resp.text, "lxml")
-
-        def get_stat(team_idx: int, stat_name: str) -> Optional[float]:
-            """team_idx: 0=home, 1=away"""
-            el = soup.find("td", {"data-stat": stat_name})
-            if el:
-                try:
-                    return float(el.get_text(strip=True))
-                except (ValueError, TypeError):
-                    pass
-            return None
-
-        # Parse team stats from #team_stats table
-        stats_block = soup.find("div", {"id": "team_stats"})
-        if not stats_block:
-            return
-
-        parsed = self._parse_team_stats_block(stats_block)
-        if not parsed:
-            return
-
+    def _target_seasons(self) -> List[int]:
+        """Use seasons present in the DB; fall back to previous year and current year."""
+        seasons: Set[int] = set()
         with db_session() as session:
-            match = session.get(Match, match_id)
-            if not match:
-                return
-            for team_id, is_home, side in [
-                (match.home_team_id, True, "home"),
-                (match.away_team_id, False, "away"),
-            ]:
-                stat = session.execute(
-                    select(TeamMatchStat).where(
-                        TeamMatchStat.match_id == match_id,
-                        TeamMatchStat.team_id == team_id,
-                    )
-                ).scalar_one_or_none()
+            for season_val in session.execute(select(Match.season)).scalars().all():
+                normalized = self._normalize_season(season_val)
+                if normalized:
+                    seasons.add(normalized)
 
-                d = parsed.get(side, {})
-                if stat:
-                    for attr in ["possession", "shots", "shots_on_target", "corners",
-                                 "fouls", "yellow_cards", "red_cards", "pass_accuracy"]:
-                        if attr in d:
-                            setattr(stat, attr, d[attr])
-                else:
-                    session.add(TeamMatchStat(
-                        match_id=match_id,
-                        team_id=team_id,
-                        is_home=is_home,
-                        **{k: v for k, v in d.items() if k in TeamMatchStat.__table__.columns},
-                    ))
+        if not seasons:
+            year = datetime.now(timezone.utc).year
+            seasons.update([year - 1, year])
 
-    def _parse_team_stats_block(self, block) -> dict:
-        """Parse possession, shots, etc. from FBref team stats HTML."""
-        result = {"home": {}, "away": {}}
-        rows = block.find_all("tr")
-        for row in rows:
-            cells = row.find_all(["td", "th"])
-            if len(cells) < 3:
-                continue
-            stat_name = cells[1].get_text(strip=True).lower()
-            home_val = self._safe_float(cells[0].get_text(strip=True).rstrip("%"))
-            away_val = self._safe_float(cells[2].get_text(strip=True).rstrip("%"))
+        return sorted(seasons)
 
-            mapping = {
-                "possession": "possession",
-                "shots": "shots",
-                "shots on target": "shots_on_target",
-                "corners": "corners",
-                "fouls": "fouls",
-                "yellow cards": "yellow_cards",
-                "red cards": "red_cards",
-            }
-            db_key = mapping.get(stat_name)
-            if db_key:
-                if home_val is not None:
-                    result["home"][db_key] = home_val
-                if away_val is not None:
-                    result["away"][db_key] = away_val
-
-        return result
+    def _normalize_season(self, val) -> Optional[int]:
+        if val is None:
+            return None
+        if isinstance(val, int):
+            return val
+        if isinstance(val, str):
+            match = re.search(r"(20\d{2})", val)
+            if match:
+                try:
+                    return int(match.group(1))
+                except ValueError:
+                    return None
+            try:
+                return int(val)
+            except ValueError:
+                return None
+        return None
