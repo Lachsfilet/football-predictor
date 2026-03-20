@@ -5,14 +5,14 @@ Replaces the brittle HTML scraping of fbref.com with a stable, cached data
 source that provides xG values. The public class name is kept for backwards
 compatibility with existing scripts.
 """
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 import re
-from typing import Dict, List, Mapping, Optional, Set
+from typing import Dict, List, Mapping, Optional, Set, Iterable
 
 import pandas as pd
 from loguru import logger
 from sqlalchemy import select
-from soccerdata import Understat
+from soccerdata import Understat, FBref
 
 from config.settings import settings
 from database.session import db_session
@@ -22,6 +22,15 @@ from .team_resolver import TeamNameResolver
 
 # Mapping of internal competition codes to soccerdata/Understat league names
 UNDERSTAT_LEAGUES: Dict[str, str] = {
+    "PL": "ENG-Premier League",
+    "PD": "ESP-La Liga",
+    "BL1": "GER-Bundesliga",
+    "SA": "ITA-Serie A",
+    "FL1": "FRA-Ligue 1",
+}
+
+# Mapping of internal competition codes to soccerdata/FBref league names
+FBREF_LEAGUES: Dict[str, str] = {
     "PL": "ENG-Premier League",
     "PD": "ESP-La Liga",
     "BL1": "GER-Bundesliga",
@@ -61,10 +70,20 @@ class FBrefConnector(BaseConnector):
             except Exception as e:
                 logger.error(f"[fbref] Error syncing {code}: {e}")
 
+            fbref_league = FBREF_LEAGUES.get(code)
+            if not fbref_league:
+                logger.warning(f"[fbref] No FBref mapping for league code {code}")
+                continue
+            try:
+                updated = self._sync_fbref_match_stats(code, fbref_league, seasons)
+                total += updated
+            except Exception as e:
+                logger.error(f"[fbref] FBref match stats sync failed for {code}: {e}")
+
         self.log_sync("fetch_all", "success", records_inserted=total, started_at=started)
 
     # ──────────────────────────────────────────
-    # Per-league sync
+    # Per-league sync (Understat xG)
     # ──────────────────────────────────────────
 
     def _sync_league_stats(self, code: str, league_name: str, seasons: List[int]) -> int:
@@ -104,6 +123,193 @@ class FBrefConnector(BaseConnector):
 
         logger.info(f"[fbref][{code}] Stats records saved: {inserted}")
         return inserted
+
+    # ──────────────────────────────────────────
+    # Per-league sync (FBref match stats)
+    # ──────────────────────────────────────────
+
+    def _sync_fbref_match_stats(self, code: str, league_name: str, seasons: List[int]) -> int:
+        """Fetch match-level stats from FBref and store TeamMatchStat fields."""
+        logger.info(f"[fbref] Fetching FBref match stats for {league_name} seasons {seasons}")
+        try:
+            fbref = FBref(leagues=league_name, seasons=seasons)
+            schedule = self._load_team_match_stats(fbref, "schedule")
+            shooting = self._load_team_match_stats(fbref, "shooting")
+            passing = self._load_team_match_stats(fbref, "passing")
+        except Exception as e:
+            logger.error(f"[fbref] FBref read failed for {league_name}: {e}")
+            return 0
+
+        if schedule.empty:
+            logger.warning(f"[fbref] No FBref schedule data for {league_name}")
+            return 0
+
+        merge_cols = self._match_merge_columns(schedule)
+        if not merge_cols:
+            logger.warning(f"[fbref] Could not determine merge columns for {league_name}")
+            return 0
+
+        if not shooting.empty:
+            shooting = shooting[self._columns_present(shooting, merge_cols + ["Sh", "SoT"])]
+            schedule = schedule.merge(shooting, on=merge_cols, how="left", suffixes=("", "_shoot"))
+
+        if not passing.empty:
+            passing = passing[self._columns_present(passing, merge_cols + ["Cmp", "Att", "Cmp%"])]
+            schedule = schedule.merge(passing, on=merge_cols, how="left", suffixes=("", "_pass"))
+
+        updated = 0
+        with db_session() as session:
+            resolver = TeamNameResolver(session)
+            for row in schedule.itertuples(index=False):
+                row_dict = row._asdict()
+                if self._save_fbref_match_stats(session, resolver, row_dict):
+                    updated += 1
+
+        logger.info(f"[fbref][{code}] Match stat rows updated: {updated}")
+        return updated
+
+    def _load_team_match_stats(self, fbref: FBref, stat_type: str) -> pd.DataFrame:
+        df = fbref.read_team_match_stats(stat_type=stat_type)
+        if isinstance(df.index, pd.MultiIndex):
+            df = df.reset_index()
+        elif df.index.name:
+            df = df.reset_index()
+        return df
+
+    def _match_merge_columns(self, df: pd.DataFrame) -> List[str]:
+        candidates = ["league", "season", "team", "game"]
+        return [c for c in candidates if c in df.columns]
+
+    def _columns_present(self, df: pd.DataFrame, columns: Iterable[str]) -> List[str]:
+        return [c for c in columns if c in df.columns]
+
+    def _save_fbref_match_stats(self, session, resolver: TeamNameResolver, row: dict) -> bool:
+        team_name = self._first_value(row, ["team", "Team"])
+        opponent_name = self._first_value(row, ["opponent", "Opponent"])
+        if not team_name or not opponent_name:
+            return False
+
+        team = resolver.resolve(str(team_name))
+        opponent = resolver.resolve(str(opponent_name))
+        if not team or not opponent:
+            return False
+
+        venue = str(self._first_value(row, ["venue", "Venue"]) or "")
+        is_home = venue.lower().startswith("home")
+        home_id = team.id if is_home else opponent.id
+        away_id = opponent.id if is_home else team.id
+
+        match_date = self._parse_date(self._first_value(row, ["date", "Date"]))
+        if not match_date:
+            return False
+
+        match_day = match_date.replace(hour=0, minute=0, second=0, microsecond=0)
+        match = session.execute(
+            select(Match).where(
+                Match.home_team_id == home_id,
+                Match.away_team_id == away_id,
+                Match.match_date >= match_day,
+                Match.match_date < match_day + timedelta(days=1),
+            )
+        ).scalar_one_or_none()
+
+        if not match:
+            return False
+
+        shots = self._coerce_int(self._first_value(row, ["Sh", "Shots"]))
+        shots_on_target = self._coerce_int(self._first_value(row, ["SoT", "SoT%", "Shots on Target"]))
+        possession = self._coerce_float(self._first_value(row, ["Poss", "Possession", "Poss%", "Possession%"]))
+        passes_att = self._coerce_int(self._first_value(row, ["Att", "Passes"], default=None))
+        pass_accuracy = self._coerce_float(self._first_value(row, ["Cmp%", "Pass%", "Cmp %"], default=None))
+        passes_cmp = self._coerce_int(self._first_value(row, ["Cmp", "Completed"], default=None))
+        if pass_accuracy is None and passes_cmp is not None and passes_att:
+            pass_accuracy = round((passes_cmp / passes_att) * 100, 2)
+
+        goals = self._coerce_int(self._first_value(row, ["GF", "Goals For", "Gls"], default=None))
+        xg = self._coerce_float(self._first_value(row, ["xG", "xg"], default=None))
+        xga = self._coerce_float(self._first_value(row, ["xGA", "xga"], default=None))
+
+        stat = session.execute(
+            select(TeamMatchStat).where(
+                TeamMatchStat.match_id == match.id,
+                TeamMatchStat.team_id == team.id,
+            )
+        ).scalar_one_or_none()
+
+        if stat:
+            if shots is not None:
+                stat.shots = shots
+            if shots_on_target is not None:
+                stat.shots_on_target = shots_on_target
+            if possession is not None:
+                stat.possession = possession
+            if passes_att is not None:
+                stat.passes = passes_att
+            if pass_accuracy is not None:
+                stat.pass_accuracy = pass_accuracy
+            if goals is not None:
+                stat.goals = goals
+            if xg is not None:
+                stat.xg = xg
+            if xga is not None:
+                stat.xga = xga
+        else:
+            session.add(TeamMatchStat(
+                match_id=match.id,
+                team_id=team.id,
+                is_home=is_home,
+                shots=shots,
+                shots_on_target=shots_on_target,
+                possession=possession,
+                passes=passes_att,
+                pass_accuracy=pass_accuracy,
+                goals=goals,
+                xg=xg,
+                xga=xga,
+            ))
+
+        return True
+
+    def _first_value(self, row: dict, keys: Iterable[str], default: Optional[object] = None):
+        for key in keys:
+            if key in row and row[key] is not None and not pd.isna(row[key]):
+                return row[key]
+        return default
+
+    def _parse_date(self, value) -> Optional[datetime]:
+        if value is None or pd.isna(value):
+            return None
+        try:
+            dt_val = pd.to_datetime(value)
+        except (ValueError, TypeError):
+            return None
+        if dt_val.tzinfo is not None:
+            dt_val = dt_val.tz_convert(None)
+        return dt_val.to_pydatetime()
+
+    def _coerce_float(self, val) -> Optional[float]:
+        if val is None or pd.isna(val):
+            return None
+        if isinstance(val, str):
+            cleaned = val.replace("%", "").replace(",", "").strip()
+        else:
+            cleaned = val
+        try:
+            return float(cleaned)
+        except (ValueError, TypeError):
+            return None
+
+    def _coerce_int(self, val) -> Optional[int]:
+        if val is None or pd.isna(val):
+            return None
+        if isinstance(val, str):
+            cleaned = val.replace(",", "").strip()
+        else:
+            cleaned = val
+        try:
+            return int(float(cleaned))
+        except (ValueError, TypeError):
+            return None
 
     def _build_record(self, row: Mapping[str, object]) -> Optional[dict]:
         """Map a soccerdata schedule row to our internal structure."""
