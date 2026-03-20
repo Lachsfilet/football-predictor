@@ -78,7 +78,8 @@ class FBrefConnector(BaseConnector):
             df = reader.read_schedule(include_matches_without_data=False)
         except FileNotFoundError:
             logger.warning(
-                f"[fbref] Understat data for {league_name} not found in cache. Run the data download first or check connectivity."
+                f"[fbref] Understat data for {league_name} not found in cache. "
+                "Run `python scripts/fetch_data.py --source fbref` first or check connectivity."
             )
             return 0
         except Exception as e:
@@ -186,14 +187,15 @@ class FBrefConnector(BaseConnector):
                     if goals is not None:
                         stat.goals = goals
                 else:
-                    session.add(TeamMatchStat(
-                        match_id=match.id,
-                        team_id=team_id,
-                        is_home=is_home,
-                        xg=xg,
-                        xga=xga,
-                        goals=goals,
-                    ))
+                    stat_payload = {
+                        "match_id": match.id,
+                        "team_id": team_id,
+                        "is_home": is_home,
+                        "xg": xg,
+                        "xga": xga,
+                        "goals": goals,
+                    }
+                    session.add(TeamMatchStat(**stat_payload))
 
         return True
 
