@@ -5,7 +5,7 @@ Replaces the brittle HTML scraping of fbref.com with a stable, cached data
 source that provides xG values. The public class name is kept for backwards
 compatibility with existing scripts.
 """
-from datetime import datetime
+from datetime import datetime, timezone
 import re
 from typing import Dict, List, Optional, Set
 
@@ -44,7 +44,7 @@ class FBrefConnector(BaseConnector):
     # ──────────────────────────────────────────
 
     def fetch_all(self):
-        started = datetime.utcnow()
+        started = datetime.now(timezone.utc)
         total = 0
         seasons = self._target_seasons()
 
@@ -91,12 +91,14 @@ class FBrefConnector(BaseConnector):
             return 0
 
         inserted = 0
-        for _, row in df.iterrows():
-            record = self._build_record(row)
-            if not record:
-                continue
-            if self._save_stats(record):
-                inserted += 1
+        with db_session() as session:
+            resolver = TeamNameResolver(session)
+            for _, row in df.iterrows():
+                record = self._build_record(row)
+                if not record:
+                    continue
+                if self._save_stats(session, resolver, record):
+                    inserted += 1
 
         logger.info(f"[fbref][{code}] Stats records saved: {inserted}")
         return inserted
@@ -145,57 +147,55 @@ class FBrefConnector(BaseConnector):
         except (ValueError, TypeError):
             return None
 
-    def _save_stats(self, record: dict) -> bool:
+    def _save_stats(self, session, resolver: TeamNameResolver, record: dict) -> bool:
         """Match the row to a DB Match and store xG values."""
-        with db_session() as session:
-            resolver = TeamNameResolver(session)
-            home_team = resolver.resolve(record["home_team_name"])
-            away_team = resolver.resolve(record["away_team_name"])
-            if not home_team or not away_team:
-                return False
+        home_team = resolver.resolve(record["home_team_name"])
+        away_team = resolver.resolve(record["away_team_name"])
+        if not home_team or not away_team:
+            return False
 
-            match_day = record["match_date"].replace(hour=0, minute=0, second=0, microsecond=0)
+        match_day = record["match_date"].replace(hour=0, minute=0, second=0, microsecond=0)
 
-            match = session.execute(
-                select(Match).where(
-                    Match.home_team_id == home_team.id,
-                    Match.away_team_id == away_team.id,
-                    Match.match_date >= match_day,
-                    Match.match_date < match_day + pd.Timedelta(days=1),
+        match = session.execute(
+            select(Match).where(
+                Match.home_team_id == home_team.id,
+                Match.away_team_id == away_team.id,
+                Match.match_date >= match_day,
+                Match.match_date < match_day + pd.Timedelta(days=1),
+            )
+        ).scalar_one_or_none()
+
+        if not match:
+            return False
+
+        for team_id, is_home, xg, xga, goals in [
+            (home_team.id, True, record["xg_home"], record["xg_away"], record["home_goals"]),
+            (away_team.id, False, record["xg_away"], record["xg_home"], record["away_goals"]),
+        ]:
+            stat = session.execute(
+                select(TeamMatchStat).where(
+                    TeamMatchStat.match_id == match.id,
+                    TeamMatchStat.team_id == team_id,
                 )
             ).scalar_one_or_none()
 
-            if not match:
-                return False
-
-            for team_id, is_home, xg, xga, goals in [
-                (home_team.id, True, record["xg_home"], record["xg_away"], record["home_goals"]),
-                (away_team.id, False, record["xg_away"], record["xg_home"], record["away_goals"]),
-            ]:
-                stat = session.execute(
-                    select(TeamMatchStat).where(
-                        TeamMatchStat.match_id == match.id,
-                        TeamMatchStat.team_id == team_id,
-                    )
-                ).scalar_one_or_none()
-
-                if stat:
-                    if xg is not None:
-                        stat.xg = xg
-                    if xga is not None:
-                        stat.xga = xga
-                    if goals is not None:
-                        stat.goals = goals
-                else:
-                    stat_payload = {
-                        "match_id": match.id,
-                        "team_id": team_id,
-                        "is_home": is_home,
-                        "xg": xg,
-                        "xga": xga,
-                        "goals": goals,
-                    }
-                    session.add(TeamMatchStat(**stat_payload))
+            if stat:
+                if xg is not None:
+                    stat.xg = xg
+                if xga is not None:
+                    stat.xga = xga
+                if goals is not None:
+                    stat.goals = goals
+            else:
+                stat_payload = {
+                    "match_id": match.id,
+                    "team_id": team_id,
+                    "is_home": is_home,
+                    "xg": xg,
+                    "xga": xga,
+                    "goals": goals,
+                }
+                session.add(TeamMatchStat(**stat_payload))
 
         return True
 
@@ -213,7 +213,7 @@ class FBrefConnector(BaseConnector):
                     seasons.add(normalized)
 
         if not seasons:
-            year = datetime.utcnow().year
+            year = datetime.now(timezone.utc).year
             seasons.update([year - 1, year])
 
         return sorted(seasons)
